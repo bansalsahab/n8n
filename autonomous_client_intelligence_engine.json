@@ -1,0 +1,580 @@
+{
+  "name": "Autonomous Client Intelligence Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 5 }]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Schedule Trigger (every 5 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 100]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "filters": {
+          "readStatus": "unread",
+          "receivedAfter": "={{ $now.minus(5, 'minutes').toISO() }}"
+        },
+        "options": { "downloadAttachments": false }
+      },
+      "id": "gmail-fetch",
+      "name": "Gmail – Fetch Unread",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [460, 60],
+      "credentials": { "gmailOAuth2": { "id": "REPLACE_GMAIL_CRED_ID", "name": "Gmail OAuth2" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubspot.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"filterGroups\": [{ \"filters\": [{ \"propertyName\": \"hs_lastmodifieddate\", \"operator\": \"GTE\", \"value\": \"{{ $now.minus(5, 'minutes').toMillis() }}\" }] }], \"properties\": [\"email\", \"firstname\", \"lastname\", \"lifecyclestage\", \"hs_lead_status\", \"notes_last_updated\", \"hs_email_last_email_name\"], \"limit\": 50 }",
+        "options": {}
+      },
+      "id": "hubspot-fetch",
+      "name": "HubSpot – Recent CRM Changes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 200],
+      "credentials": { "oAuth2Api": { "id": "REPLACE_HUBSPOT_CRED_ID", "name": "HubSpot OAuth2" } }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "getAll",
+        "channel": "REPLACE_SLACK_CHANNEL_ID",
+        "filters": {
+          "oldest": "={{ $now.minus(5, 'minutes').toUnixTime() }}"
+        },
+        "limit": 20
+      },
+      "id": "slack-fetch",
+      "name": "Slack – Fetch Support Channel",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [460, 340],
+      "credentials": { "slackApi": { "id": "REPLACE_SLACK_CRED_ID", "name": "Slack API" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge all data sources into a unified signal array\nconst emails = $('Gmail – Fetch Unread').all().map(item => ({\n  source: 'email',\n  id: item.json.id,\n  from: item.json.from,\n  subject: item.json.subject,\n  body: item.json.snippet || item.json.textPlain || '',\n  timestamp: item.json.date,\n  raw: item.json\n}));\n\nconst crmContacts = (() => {\n  try {\n    const res = $('HubSpot – Recent CRM Changes').first().json;\n    const results = res.results || [];\n    return results.map(c => ({\n      source: 'crm',\n      id: c.id,\n      email: c.properties?.email || '',\n      name: `${c.properties?.firstname || ''} ${c.properties?.lastname || ''}`.trim(),\n      lifecyclestage: c.properties?.lifecyclestage || '',\n      lead_status: c.properties?.hs_lead_status || '',\n      timestamp: c.properties?.hs_lastmodifieddate || '',\n      raw: c\n    }));\n  } catch(e) { return []; }\n})();\n\nconst slackMessages = $('Slack – Fetch Support Channel').all().map(item => ({\n  source: 'slack',\n  id: item.json.ts,\n  user: item.json.user,\n  text: item.json.text || '',\n  timestamp: item.json.ts,\n  raw: item.json\n}));\n\nconst signals = [...emails, ...crmContacts, ...slackMessages];\n\nif (signals.length === 0) {\n  return [{ json: { signals: [], skip: true } }];\n}\n\nreturn [{ json: { signals, skip: false, total: signals.length } }];"
+      },
+      "id": "merge-signals",
+      "name": "Merge All Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{ $json.skip }}", "value2": true }]
+        }
+      },
+      "id": "check-skip",
+      "name": "Any signals?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split signals into individual items for processing\nconst { signals } = $input.first().json;\nreturn signals.map(s => ({ json: s }));"
+      },
+      "id": "split-signals",
+      "name": "Split Into Individual Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 200]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert B2B client intelligence triage agent. Your job is to analyze incoming signals (emails, CRM events, Slack messages) and classify them precisely.\n\nYou MUST respond with ONLY valid JSON in this exact format:\n{\n  \"urgency\": \"critical|high|medium|low\",\n  \"sentiment\": \"very_positive|positive|neutral|negative|very_negative\",\n  \"intent\": \"churn_risk|upsell_opportunity|support_request|renewal|general_inquiry|complaint|positive_feedback|meeting_request\",\n  \"customer_tier\": \"enterprise|mid_market|smb|unknown\",\n  \"confidence\": 0.0-1.0,\n  \"summary\": \"One sentence summary of what is happening\",\n  \"recommended_action\": \"send_email|create_task|send_proposal|alert_human|update_crm|no_action\",\n  \"reasoning\": \"Brief explanation of your classification\",\n  \"requires_human\": true|false\n}\n\nClassification rules:\n- urgency=critical: potential churn, payment issue, legal/compliance, outage\n- urgency=high: upsell ready, renewal due, complaint, demo request\n- confidence < 0.75 → set requires_human: true\n- enterprise tier always set requires_human: true for churn_risk"
+            },
+            {
+              "role": "user",
+              "content": "=Analyze this signal and classify it:\n\nSource: {{ $json.source }}\nTimestamp: {{ $json.timestamp }}\n\n{% if $json.source === 'email' %}From: {{ $json.from }}\nSubject: {{ $json.subject }}\nBody preview: {{ $json.body }}\n{% endif %}\n{% if $json.source === 'crm' %}Contact: {{ $json.name }} ({{ $json.email }})\nLifecycle stage: {{ $json.lifecyclestage }}\nLead status: {{ $json.lead_status }}\n{% endif %}\n{% if $json.source === 'slack' %}User ID: {{ $json.user }}\nMessage: {{ $json.text }}\n{% endif %}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 600,
+          "responseFormat": "json_object"
+        }
+      },
+      "id": "triage-agent",
+      "name": "Triage Agent (GPT-4o)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.4,
+      "position": [1300, 200],
+      "credentials": { "openAiApi": { "id": "REPLACE_OPENAI_CRED_ID", "name": "OpenAI API" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse triage output and enrich signal\nconst signal = $('Split Into Individual Signals').item.json;\nlet triage = {};\n\ntry {\n  const content = $input.first().json.message?.content || $input.first().json.choices?.[0]?.message?.content || '{}';\n  triage = JSON.parse(content);\n} catch(e) {\n  triage = {\n    urgency: 'medium',\n    sentiment: 'neutral',\n    intent: 'general_inquiry',\n    customer_tier: 'unknown',\n    confidence: 0.5,\n    summary: 'Could not parse signal',\n    recommended_action: 'alert_human',\n    reasoning: 'Parse error',\n    requires_human: true\n  };\n}\n\nreturn [{ json: { ...signal, triage, processedAt: new Date().toISOString() } }];"
+      },
+      "id": "parse-triage",
+      "name": "Parse Triage Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 200]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "string": [{ "value1": "={{ $json.triage.recommended_action }}", "value2": "send_email" }]
+              },
+              "renameOutput": true,
+              "outputKey": "send_email"
+            },
+            {
+              "conditions": {
+                "string": [{ "value1": "={{ $json.triage.recommended_action }}", "value2": "send_proposal" }]
+              },
+              "renameOutput": true,
+              "outputKey": "send_proposal"
+            },
+            {
+              "conditions": {
+                "string": [{ "value1": "={{ $json.triage.recommended_action }}", "value2": "create_task" }]
+              },
+              "renameOutput": true,
+              "outputKey": "create_task"
+            },
+            {
+              "conditions": {
+                "string": [{ "value1": "={{ $json.triage.recommended_action }}", "value2": "alert_human" }]
+              },
+              "renameOutput": true,
+              "outputKey": "alert_human"
+            }
+          ]
+        },
+        "fallbackOutput": "extra"
+      },
+      "id": "action-router",
+      "name": "Action Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1700, 200]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert B2B client success email writer. Write professional, warm, personalized emails that drive action.\n\nRules:\n- Subject line: punchy, specific, no buzzwords\n- Body: 3-4 short paragraphs max\n- Always reference their specific situation\n- Clear single CTA\n- Sign as 'The [Company] Team'\n\nRespond with ONLY JSON:\n{\n  \"subject\": \"email subject line\",\n  \"body\": \"full email body with \\n for line breaks\",\n  \"tone\": \"professional|empathetic|urgent|excited\"\n}"
+            },
+            {
+              "role": "user",
+              "content": "=Write an email response for this situation:\n\nOriginal signal source: {{ $json.source }}\nIntent: {{ $json.triage.intent }}\nSentiment: {{ $json.triage.sentiment }}\nUrgency: {{ $json.triage.urgency }}\nSummary: {{ $json.triage.summary }}\nCustomer tier: {{ $json.triage.customer_tier }}\n\n{% if $json.source === 'email' %}Original message from: {{ $json.from }}\nSubject: {{ $json.subject }}\nBody: {{ $json.body }}\n{% endif %}\n{% if $json.source === 'crm' %}Contact: {{ $json.name }} ({{ $json.email }})\n{% endif %}\n\nAdditional context: {{ $json.triage.reasoning }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 800,
+          "responseFormat": "json_object"
+        }
+      },
+      "id": "email-drafter",
+      "name": "Email Drafter Agent (GPT-4o)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.4,
+      "position": [1900, 60],
+      "credentials": { "openAiApi": { "id": "REPLACE_OPENAI_CRED_ID", "name": "OpenAI API" } }
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a senior B2B sales consultant writing compelling business proposals.\n\nWrite a professional upsell or renewal proposal. Include:\n1. Executive summary (2 sentences)\n2. Current value delivered\n3. Proposed next step / upgrade\n4. ROI justification\n5. Clear CTA with urgency\n\nRespond with ONLY JSON:\n{\n  \"subject\": \"proposal email subject\",\n  \"executive_summary\": \"2 sentence summary\",\n  \"body\": \"full proposal email body\",\n  \"proposed_tier\": \"tier name or plan\",\n  \"estimated_value\": \"value statement\"\n}"
+            },
+            {
+              "role": "user",
+              "content": "=Write a proposal for:\n\nIntent: {{ $json.triage.intent }}\nCustomer tier: {{ $json.triage.customer_tier }}\nSummary: {{ $json.triage.summary }}\nSentiment: {{ $json.triage.sentiment }}\n\n{% if $json.source === 'email' %}Contact email: {{ $json.from }}\nContext: {{ $json.body }}\n{% endif %}\n{% if $json.source === 'crm' %}Contact: {{ $json.name }}\nLifecycle: {{ $json.lifecyclestage }}\n{% endif %}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.6,
+          "maxTokens": 900,
+          "responseFormat": "json_object"
+        }
+      },
+      "id": "proposal-agent",
+      "name": "Proposal Generator Agent (GPT-4o)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.4,
+      "position": [1900, 200],
+      "credentials": { "openAiApi": { "id": "REPLACE_OPENAI_CRED_ID", "name": "OpenAI API" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build task details from signal\nconst signal = $input.first().json;\nconst triage = signal.triage;\n\nconst priorityMap = {\n  critical: 'urgent',\n  high: 'high',\n  medium: 'normal',\n  low: 'low'\n};\n\nconst taskName = `[${triage.urgency.toUpperCase()}] ${triage.summary}`;\nconst taskNotes = `Source: ${signal.source}\\nIntent: ${triage.intent}\\nSentiment: ${triage.sentiment}\\nCustomer tier: ${triage.customer_tier}\\nConfidence: ${triage.confidence}\\nReasoning: ${triage.reasoning}\\n\\nProcessed at: ${signal.processedAt}`;\n\nreturn [{ json: { ...signal, task: { name: taskName, notes: taskNotes, priority: priorityMap[triage.urgency] || 'normal' } } }];"
+      },
+      "id": "task-builder",
+      "name": "Build Task Details",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1900, 340]
+    },
+    {
+      "parameters": {
+        "resource": "task",
+        "operation": "create",
+        "workspace": "REPLACE_ASANA_WORKSPACE_ID",
+        "project": "REPLACE_ASANA_PROJECT_ID",
+        "name": "={{ $json.task.name }}",
+        "additionalFields": {
+          "notes": "={{ $json.task.notes }}",
+          "due_on": "={{ $now.plus(2, 'days').toISODate() }}"
+        }
+      },
+      "id": "asana-task",
+      "name": "Create Asana Task",
+      "type": "n8n-nodes-base.asana",
+      "typeVersion": 1,
+      "position": [2100, 340],
+      "credentials": { "asanaApi": { "id": "REPLACE_ASANA_CRED_ID", "name": "Asana API" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse email draft output\nconst signal = $('Action Router').item.json;\nlet draft = {};\n\ntry {\n  const content = $input.first().json.message?.content || $input.first().json.choices?.[0]?.message?.content || '{}';\n  draft = JSON.parse(content);\n} catch(e) {\n  draft = { subject: 'Follow up from our team', body: 'We noticed your recent activity and wanted to reach out.', tone: 'professional' };\n}\n\nconst autoSend = signal.triage.confidence >= 0.85 && !signal.triage.requires_human;\n\nreturn [{ json: { ...signal, draft, autoSend } }];"
+      },
+      "id": "parse-email-draft",
+      "name": "Parse Email Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2100, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse proposal output\nconst signal = $('Action Router').item.json;\nlet proposal = {};\n\ntry {\n  const content = $input.first().json.message?.content || $input.first().json.choices?.[0]?.message?.content || '{}';\n  proposal = JSON.parse(content);\n} catch(e) {\n  proposal = { subject: 'A proposal from our team', body: 'We have an exciting opportunity for you.', executive_summary: 'Proposal pending.' };\n}\n\nconst autoSend = signal.triage.confidence >= 0.85 && !signal.triage.requires_human;\n\nreturn [{ json: { ...signal, proposal, autoSend } }];"
+      },
+      "id": "parse-proposal",
+      "name": "Parse Proposal",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2100, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{ $json.autoSend }}", "value2": true }]
+        }
+      },
+      "id": "auto-send-gate-email",
+      "name": "Auto-send gate (email)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2300, 60]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{ $json.autoSend }}", "value2": true }]
+        }
+      },
+      "id": "auto-send-gate-proposal",
+      "name": "Auto-send gate (proposal)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2300, 200]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "toList": "={{ $json.source === 'email' ? $json.from : $json.email }}",
+        "subject": "={{ $json.draft.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.draft.body }}"
+      },
+      "id": "gmail-send-auto",
+      "name": "Send Email Automatically",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [2500, 20],
+      "credentials": { "gmailOAuth2": { "id": "REPLACE_GMAIL_CRED_ID", "name": "Gmail OAuth2" } }
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "toList": "={{ $json.source === 'email' ? $json.from : $json.email }}",
+        "subject": "={{ $json.proposal.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.proposal.body }}"
+      },
+      "id": "gmail-send-proposal-auto",
+      "name": "Send Proposal Automatically",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [2500, 180],
+      "credentials": { "gmailOAuth2": { "id": "REPLACE_GMAIL_CRED_ID", "name": "Gmail OAuth2" } }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "REPLACE_SLACK_APPROVAL_CHANNEL_ID",
+        "text": "=:email: *Email draft needs approval*\n\n*Signal:* {{ $json.triage.summary }}\n*Intent:* {{ $json.triage.intent }} | *Urgency:* {{ $json.triage.urgency }} | *Confidence:* {{ ($json.triage.confidence * 100).toFixed(0) }}%\n\n*Draft subject:* {{ $json.draft.subject }}\n*Draft preview:* {{ $json.draft.body.substring(0, 300) }}...\n\n✅ Reply `APPROVE {{ $json.id || $json.ts }}` to send\n❌ Reply `REJECT {{ $json.id || $json.ts }}` to discard",
+        "attachments": []
+      },
+      "id": "slack-approval-email",
+      "name": "Slack – Request Email Approval",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2500, 100],
+      "credentials": { "slackApi": { "id": "REPLACE_SLACK_CRED_ID", "name": "Slack API" } }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "REPLACE_SLACK_APPROVAL_CHANNEL_ID",
+        "text": "=:briefcase: *Proposal needs approval*\n\n*Signal:* {{ $json.triage.summary }}\n*Intent:* {{ $json.triage.intent }} | *Customer tier:* {{ $json.triage.customer_tier }}\n*Proposed tier:* {{ $json.proposal.proposed_tier }}\n\n*Executive summary:* {{ $json.proposal.executive_summary }}\n*Subject:* {{ $json.proposal.subject }}\n\n✅ Reply `APPROVE {{ $json.id || $json.ts }}` to send\n❌ Reply `REJECT {{ $json.id || $json.ts }}` to discard",
+        "attachments": []
+      },
+      "id": "slack-approval-proposal",
+      "name": "Slack – Request Proposal Approval",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2500, 260],
+      "credentials": { "slackApi": { "id": "REPLACE_SLACK_CRED_ID", "name": "Slack API" } }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "REPLACE_SLACK_ALERTS_CHANNEL_ID",
+        "text": "=:rotating_light: *URGENT – Human action required*\n\n*Summary:* {{ $json.triage.summary }}\n*Urgency:* {{ $json.triage.urgency.toUpperCase() }}\n*Intent:* {{ $json.triage.intent }}\n*Sentiment:* {{ $json.triage.sentiment }}\n*Customer tier:* {{ $json.triage.customer_tier }}\n*Source:* {{ $json.source }}\n\n{% if $json.source === 'email' %}*From:* {{ $json.from }}\n*Subject:* {{ $json.subject }}\n{% endif %}\n{% if $json.source === 'crm' %}*Contact:* {{ $json.name }} ({{ $json.email }})\n{% endif %}\n\n*AI reasoning:* {{ $json.triage.reasoning }}\n\n_Please review immediately._",
+        "attachments": []
+      },
+      "id": "slack-alert-human",
+      "name": "Slack – Alert Human (Urgent)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1900, 460],
+      "credentials": { "slackApi": { "id": "REPLACE_SLACK_CRED_ID", "name": "Slack API" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubspot.com/crm/v3/objects/contacts/upsert",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"inputs\": [{\n    \"idProperty\": \"email\",\n    \"id\": \"{{ $json.source === 'email' ? $json.from.match(/[\\\\w.+-]+@[\\\\w-]+\\\\.[a-z]{2,}/)?.[0] || '' : $json.email || '' }}\",\n    \"properties\": {\n      \"hs_lead_status\": \"{{ $json.triage.intent === 'churn_risk' ? 'IN_PROGRESS' : $json.triage.intent === 'upsell_opportunity' ? 'OPEN' : 'CONNECTED' }}\",\n      \"hs_analytics_last_visit_timestamp\": \"{{ Date.now() }}\",\n      \"notes_last_updated\": \"{{ Date.now() }}\"\n    }\n  }]\n}",
+        "options": {}
+      },
+      "id": "hubspot-update",
+      "name": "HubSpot – Update Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2100, 460],
+      "credentials": { "oAuth2Api": { "id": "REPLACE_HUBSPOT_CRED_ID", "name": "HubSpot OAuth2" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log every processed action to an audit trail\nconst signal = $input.first().json;\nconst logEntry = {\n  timestamp: new Date().toISOString(),\n  signalId: signal.id || signal.ts || Math.random().toString(36).substr(2,9),\n  source: signal.source,\n  urgency: signal.triage?.urgency,\n  intent: signal.triage?.intent,\n  sentiment: signal.triage?.sentiment,\n  customer_tier: signal.triage?.customer_tier,\n  confidence: signal.triage?.confidence,\n  recommended_action: signal.triage?.recommended_action,\n  auto_sent: signal.autoSend || false,\n  summary: signal.triage?.summary,\n  requires_human: signal.triage?.requires_human\n};\n\nconsole.log('AUDIT LOG:', JSON.stringify(logEntry));\nreturn [{ json: logEntry }];"
+      },
+      "id": "audit-logger",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2300, 460]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "REPLACE_WEBHOOK_DASHBOARD_URL",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "response": { "response": { "neverError": true } }
+        }
+      },
+      "id": "dashboard-log",
+      "name": "Dashboard Log (webhook)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2500, 460]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (every 5 min)": {
+      "main": [[
+        { "node": "Gmail – Fetch Unread", "type": "main", "index": 0 },
+        { "node": "HubSpot – Recent CRM Changes", "type": "main", "index": 0 },
+        { "node": "Slack – Fetch Support Channel", "type": "main", "index": 0 }
+      ]]
+    },
+    "Gmail – Fetch Unread": {
+      "main": [[{ "node": "Merge All Signals", "type": "main", "index": 0 }]]
+    },
+    "HubSpot – Recent CRM Changes": {
+      "main": [[{ "node": "Merge All Signals", "type": "main", "index": 0 }]]
+    },
+    "Slack – Fetch Support Channel": {
+      "main": [[{ "node": "Merge All Signals", "type": "main", "index": 0 }]]
+    },
+    "Merge All Signals": {
+      "main": [[{ "node": "Any signals?", "type": "main", "index": 0 }]]
+    },
+    "Any signals?": {
+      "main": [
+        [],
+        [{ "node": "Split Into Individual Signals", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split Into Individual Signals": {
+      "main": [[{ "node": "Triage Agent (GPT-4o)", "type": "main", "index": 0 }]]
+    },
+    "Triage Agent (GPT-4o)": {
+      "main": [[{ "node": "Parse Triage Result", "type": "main", "index": 0 }]]
+    },
+    "Parse Triage Result": {
+      "main": [[
+        { "node": "Action Router", "type": "main", "index": 0 },
+        { "node": "HubSpot – Update Contact", "type": "main", "index": 0 }
+      ]]
+    },
+    "Action Router": {
+      "main": [
+        [{ "node": "Email Drafter Agent (GPT-4o)", "type": "main", "index": 0 }],
+        [{ "node": "Proposal Generator Agent (GPT-4o)", "type": "main", "index": 0 }],
+        [{ "node": "Build Task Details", "type": "main", "index": 0 }],
+        [{ "node": "Slack – Alert Human (Urgent)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Email Drafter Agent (GPT-4o)": {
+      "main": [[{ "node": "Parse Email Draft", "type": "main", "index": 0 }]]
+    },
+    "Parse Email Draft": {
+      "main": [[{ "node": "Auto-send gate (email)", "type": "main", "index": 0 }]]
+    },
+    "Auto-send gate (email)": {
+      "main": [
+        [{ "node": "Send Email Automatically", "type": "main", "index": 0 }],
+        [{ "node": "Slack – Request Email Approval", "type": "main", "index": 0 }]
+      ]
+    },
+    "Proposal Generator Agent (GPT-4o)": {
+      "main": [[{ "node": "Parse Proposal", "type": "main", "index": 0 }]]
+    },
+    "Parse Proposal": {
+      "main": [[{ "node": "Auto-send gate (proposal)", "type": "main", "index": 0 }]]
+    },
+    "Auto-send gate (proposal)": {
+      "main": [
+        [{ "node": "Send Proposal Automatically", "type": "main", "index": 0 }],
+        [{ "node": "Slack – Request Proposal Approval", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Task Details": {
+      "main": [[{ "node": "Create Asana Task", "type": "main", "index": 0 }]]
+    },
+    "Send Email Automatically": {
+      "main": [[{ "node": "Audit Logger", "type": "main", "index": 0 }]]
+    },
+    "Send Proposal Automatically": {
+      "main": [[{ "node": "Audit Logger", "type": "main", "index": 0 }]]
+    },
+    "Slack – Request Email Approval": {
+      "main": [[{ "node": "Audit Logger", "type": "main", "index": 0 }]]
+    },
+    "Slack – Request Proposal Approval": {
+      "main": [[{ "node": "Audit Logger", "type": "main", "index": 0 }]]
+    },
+    "Slack – Alert Human (Urgent)": {
+      "main": [[{ "node": "Audit Logger", "type": "main", "index": 0 }]]
+    },
+    "Create Asana Task": {
+      "main": [[{ "node": "Audit Logger", "type": "main", "index": 0 }]]
+    },
+    "HubSpot – Update Contact": {
+      "main": [[{ "node": "Audit Logger", "type": "main", "index": 0 }]]
+    },
+    "Audit Logger": {
+      "main": [[{ "node": "Dashboard Log (webhook)", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "",
+    "timezone": "UTC"
+  },
+  "staticData": null,
+  "tags": [
+    { "name": "AI Agent" },
+    { "name": "Client Intelligence" },
+    { "name": "OpenAI" },
+    { "name": "Automation" }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2026-03-13T00:00:00.000Z",
+  "id": "autonomous-client-intelligence-engine",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "autonomous-client-intelligence-v1"
+  },
+  "_setup_instructions": {
+    "step_1_credentials": {
+      "REPLACE_GMAIL_CRED_ID": "Create Gmail OAuth2 credential in n8n → Credentials → New → Gmail OAuth2",
+      "REPLACE_OPENAI_CRED_ID": "Create OpenAI API credential with your OpenAI API key",
+      "REPLACE_HUBSPOT_CRED_ID": "Create HubSpot OAuth2 credential (or Private App token)",
+      "REPLACE_SLACK_CRED_ID": "Create Slack API credential with Bot Token (xoxb-...)",
+      "REPLACE_ASANA_CRED_ID": "Create Asana Personal Access Token credential"
+    },
+    "step_2_ids": {
+      "REPLACE_SLACK_CHANNEL_ID": "The channel ID of your Slack support channel (e.g. C0123456789)",
+      "REPLACE_SLACK_APPROVAL_CHANNEL_ID": "Channel for AI draft approvals",
+      "REPLACE_SLACK_ALERTS_CHANNEL_ID": "Channel for urgent human alerts",
+      "REPLACE_ASANA_WORKSPACE_ID": "Your Asana workspace GID (found in Asana URL)",
+      "REPLACE_ASANA_PROJECT_ID": "Your Asana project GID for client tasks",
+      "REPLACE_WEBHOOK_DASHBOARD_URL": "Optional: your dashboard webhook URL, or delete this node"
+    },
+    "step_3_test": [
+      "1. Import this JSON into n8n via Workflows → Import from file",
+      "2. Replace all REPLACE_ values with real credential IDs and channel IDs",
+      "3. Activate credentials in n8n Credentials panel",
+      "4. Run workflow manually once to test with real data",
+      "5. Activate the workflow to run every 5 minutes"
+    ],
+    "confidence_threshold": "Emails/proposals with triage confidence >= 0.85 are sent automatically. Below that, they go to Slack for human approval. Adjust in the 'Parse Email Draft' and 'Parse Proposal' Code nodes.",
+    "openai_model": "All agents use gpt-4o. Change to gpt-4o-mini in each OpenAI node to reduce costs during testing."
+  }
+}
